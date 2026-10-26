@@ -643,6 +643,20 @@ class TransformConfig(BaseModel):
     )
 
 
+class ControllerCredentialAccess(BaseModel):
+    namespace: str
+    deployment: str
+    container: str | None = None
+
+
+class CredentialSyncConfig(BaseModel):
+    source: ControllerCredentialAccess
+    target: ControllerCredentialAccess
+    oc_binary: str = "/usr/local/bin/oc"
+    server: str | None = None
+    verify_ssl: bool = True
+
+
 class MigrationConfig(BaseSettings):
     """Main migration configuration."""
 
@@ -656,6 +670,7 @@ class MigrationConfig(BaseSettings):
     # AAP Instances
     source: AAPInstanceConfig = Field(..., description="Source AAP configuration")
     target: AAPInstanceConfig = Field(..., description="Target AAP configuration")
+    credential_sync: CredentialSyncConfig | None = None
 
     # Vault (optional)
     vault: VaultConfig | None = Field(default=None, description="Vault configuration")
