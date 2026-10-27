@@ -75,7 +75,7 @@ def unique(rows, kind):
     return result
 
 
-def validate(snapshot, allow_credentials=False):
+def validate(snapshot, allow_credentials=False, allow_missing_inventory=False):
     """Validate the entire source graph before making any writes."""
     if not snapshot.get("organizations"):
         raise SyncError("Snapshot has no organization.")
@@ -112,7 +112,10 @@ def validate(snapshot, allow_credentials=False):
                 "Project execution-environment mapping is not implemented in this sync path."
             )
     for row in snapshot["job_templates"]:
-        if row.get("project") not in projects or row.get("inventory") not in inventories:
+        inventory_missing = row.get("inventory") is None and allow_missing_inventory
+        if row.get("project") not in projects or (
+            row.get("inventory") not in inventories and not inventory_missing
+        ):
             raise SyncError(
                 "Job template references a project or inventory outside the selected organization."
             )
@@ -130,7 +133,9 @@ def validate(snapshot, allow_credentials=False):
             raise SyncError("Survey synchronization is not implemented in this sync path.")
 
 
-async def snapshot_org(client, organization, required=True, include_credentials=False):
+async def snapshot_org(
+    client, organization, required=True, include_credentials=False, allow_missing_inventory=False
+):
     matches = [
         row
         for row in await list_all(client, "organizations/", name=organization)
@@ -165,7 +170,11 @@ async def snapshot_org(client, organization, required=True, include_credentials=
         template["_credential_ids"] = [row["id"] for row in credentials]
     if include_credentials:
         snapshot["credentials"] = await list_all(client, "credentials/", organization=org["id"])
-    validate(snapshot, allow_credentials=include_credentials)
+    validate(
+        snapshot,
+        allow_credentials=include_credentials,
+        allow_missing_inventory=allow_missing_inventory,
+    )
     return snapshot
 
 
@@ -186,25 +195,46 @@ async def reconcile(
     project_timeout=300,
     credential_session=None,
     source_client=None,
+    checkpoint=None,
 ):
     validate(snapshot, allow_credentials=credential_session is not None)
     if not snapshot["organizations"] or snapshot["organizations"]["name"] != organization:
         raise SyncError("Snapshot does not match the selected organization.")
     existing = await snapshot_org(
-        target, organization, required=False, include_credentials=credential_session is not None
+        target,
+        organization,
+        required=False,
+        include_credentials=credential_session is not None,
+        allow_missing_inventory=True,
     )
+    if checkpoint is not None:
+        checkpoint.bind(snapshot["organizations"], existing["organizations"])
     if credential_session is not None:
+        kwargs = {"checkpoint": checkpoint} if checkpoint is not None else {}
         await credential_session.prepare(
             source_client,
             target,
             organization,
             snapshot.get("credentials", []),
             existing.get("credentials", []),
+            **kwargs,
         )
     changes = []
     mappings = {kind: {} for kind in ENDPOINTS}
+    existing_by_id = {kind: {row["id"]: row for row in existing[kind]} for kind in ENDPOINTS}
 
     async def upsert(kind, source, current, parents=None):
+        if checkpoint is not None and checkpoint.can_skip(kind, source, current, parents):
+            changes.append(
+                {
+                    "resource": kind,
+                    "name": source["name"],
+                    "action": "unchanged",
+                    "fields": [],
+                    "incremental_skipped": True,
+                }
+            )
+            return current
         payload = {field: deepcopy(source[field]) for field in FIELDS[kind] if field in source}
         payload.update(parents or {})
         endpoint = "organizations" if kind == "organizations" else ENDPOINTS[kind]
@@ -247,10 +277,18 @@ async def reconcile(
             if kind == "job_templates":
                 parents["project"] = mappings["projects"][row["project"]]
             key = (parents["inventory"], row["name"]) if kind == "hosts" else row["name"]
-            result = await upsert(kind, row, index.get(key), parents)
+            current = (
+                checkpoint.target_for(kind, row, existing_by_id[kind])
+                if checkpoint is not None
+                else None
+            )
+            current = current or index.get(key)
+            # Never rename one tracked resource onto another resource's natural key.
+            if current and index.get(key) and current["id"] != index[key]["id"]:
+                raise SyncError("Tracked target identity conflicts with another resource's name.")
+            result = await upsert(kind, row, current, parents)
             mappings[kind][row["id"]] = result["id"]
             if kind == "job_templates" and credential_session is not None:
-                current = index.get(key)
                 current_ids = set(current.get("_credential_ids", [])) if current else set()
                 desired_ids = {
                     credential_mappings[value] for value in row.get("_credential_ids", [])
@@ -271,7 +309,15 @@ async def reconcile(
                         )
         # Newly created Git projects must finish syncing before playbook validation.
         if kind == "projects" and apply and snapshot["job_templates"]:
-            for project_id in set(mappings[kind].values()):
+            skipped = {
+                row["name"]
+                for row in changes
+                if row["resource"] == "projects" and row.get("incremental_skipped")
+            }
+            wait_ids = {
+                mappings[kind][row["id"]] for row in snapshot[kind] if row["name"] not in skipped
+            }
+            for project_id in wait_ids:
                 deadline = time.monotonic() + project_timeout
                 while True:
                     project = await target.get(f"projects/{project_id}/")
@@ -292,15 +338,92 @@ async def reconcile(
                             "Timed out waiting for project sync; inspect it in AAP and rerun."
                         )
                     await asyncio.sleep(2)
-    return {
+    report = {
         "organization": organization,
         "applied": apply,
         "summary": dict(Counter(change["action"] for change in changes)),
         "changes": changes,
     }
+    if checkpoint is not None:
+        report["incremental"] = {
+            "resources_skipped": sum(bool(row.get("incremental_skipped")) for row in changes),
+            "resources_processed": sum(
+                not row.get("incremental_skipped", False)
+                and row["resource"] != "credential_associations"
+                for row in changes
+            ),
+        }
+        if apply:
+            final = await snapshot_org(
+                target, organization, include_credentials=credential_session is not None
+            )
+            all_mappings = {
+                "organizations": {snapshot["organizations"]["id"]: org["id"]},
+                **mappings,
+            }
+            if credential_session is not None:
+                all_mappings["credentials"] = credential_mappings
+            # A checkpoint is not proof of success unless the final visible fields agree.
+            for kind in ("organizations", *ENDPOINTS):
+                source_rows = [snapshot[kind]] if kind == "organizations" else snapshot[kind]
+                target_rows = [final[kind]] if kind == "organizations" else final[kind]
+                targets = {row["id"]: row for row in target_rows}
+                for row in source_rows:
+                    current = targets.get(all_mappings[kind][row["id"]])
+                    if current is None or any(
+                        not equal(current.get(field), row[field], field)
+                        for field in FIELDS[kind]
+                        if field in row
+                    ):
+                        raise SyncError(
+                            "Final target fields did not verify; incremental checkpoint not advanced."
+                        )
+                    expected_links = {}
+                    if kind in ("inventories", "projects"):
+                        expected_links["organization"] = org["id"]
+                    if kind in ("hosts", "job_templates"):
+                        expected_links["inventory"] = mappings["inventories"][row["inventory"]]
+                    if kind == "job_templates":
+                        expected_links["project"] = mappings["projects"][row["project"]]
+                        if credential_session is not None and not {
+                            credential_mappings[value] for value in row.get("_credential_ids", [])
+                        }.issubset(current.get("_credential_ids", [])):
+                            raise SyncError(
+                                "Final credential associations did not verify; checkpoint not advanced."
+                            )
+                    if kind == "projects" and credential_session is not None:
+                        expected_links["credential"] = (
+                            credential_mappings[row["credential"]]
+                            if row.get("credential")
+                            else None
+                        )
+                    if any(current.get(key) != value for key, value in expected_links.items()):
+                        raise SyncError(
+                            "Final target dependencies did not verify; checkpoint not advanced."
+                        )
+            if credential_session is not None:
+                credential_session.validate_final(
+                    final.get("credentials", []), org["id"], credential_mappings
+                )
+            checkpoint.complete(snapshot, final, all_mappings)
+            if credential_session is not None:
+                # If a credential changed after its verified read, force a fresh
+                # fingerprint comparison next run rather than caching that interval.
+                from aap_migration.sync_checkpoint import modified_on
+
+                for row in snapshot.get("credentials", []):
+                    target_id = credential_mappings[row["id"]]
+                    record = checkpoint.records["credentials"][str(row["id"])]
+                    if record["target_modified_on"] != modified_on(
+                        credential_session.verified_metadata.get(target_id, {})
+                    ):
+                        record["target_modified_on"] = None
+    return report
 
 
-async def synchronize(source, target, organization, apply=False, credential_session=None):
+async def synchronize(
+    source, target, organization, apply=False, credential_session=None, checkpoint=None
+):
     snapshot = await snapshot_org(
         source, organization, include_credentials=credential_session is not None
     )
@@ -311,4 +434,5 @@ async def synchronize(source, target, organization, apply=False, credential_sess
         apply=apply,
         credential_session=credential_session,
         source_client=source,
+        checkpoint=checkpoint,
     )

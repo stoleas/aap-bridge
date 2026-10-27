@@ -184,7 +184,11 @@ async def write_credential(client, endpoint, payload, method):
             raise ValueError()
         result = response.json()
         # Never retain returned credential inputs, even if an API fails to mask them.
-        return {key: result[key] for key in ("id", "name", "organization", "credential_type")}
+        return {
+            key: result[key]
+            for key in ("id", "name", "organization", "credential_type", "modified")
+            if key in result
+        }
     except Exception:
         raise CredentialSyncError(
             "Target credential write failed; API response withheld to protect inputs."
@@ -198,10 +202,17 @@ class CredentialSession:
         self.rows, self.matches, self.types = [], {}, {}
         self.source_fingerprints, self.target_fingerprints = {}, {}
         self.organization = None
+        self.skipped = set()
+        self.verified_metadata = {}
 
-    async def prepare(self, source, target, organization, source_rows, target_rows):
+    async def prepare(
+        self, source, target, organization, source_rows, target_rows, checkpoint=None
+    ):
         from aap_migration.org_sync import list_all
 
+        self.key = Fernet.generate_key()
+        self.matches, self.types = {}, {}
+        self.skipped, self.verified_metadata = set(), {}
         self.organization = organization
         self.rows = source_rows
         for reader in (self.source_reader, self.target_reader):
@@ -209,26 +220,39 @@ class CredentialSession:
                 reader.discover()
         # Credential name is only unique together with organization and type.
         source_index, target_index = {}, {}
+        target_by_id = {row["id"]: row for row in target_rows}
         for rows, client, index in (
             (source_rows, source, source_index),
             (target_rows, target, target_index),
         ):
+            schemas = {}
             for row in rows:
-                kind = await client.get(f"credential_types/{row['credential_type']}/")
+                if row["credential_type"] not in schemas:
+                    schemas[row["credential_type"]] = await client.get(
+                        f"credential_types/{row['credential_type']}/"
+                    )
+                kind = schemas[row["credential_type"]]
                 key = (row["name"], kind["name"], kind["kind"])
                 if key in index:
                     raise CredentialSyncError(
                         "Ambiguous credential name/type in the selected organization."
                     )
                 index[key] = (row, kind)
+        type_choices = {}
         for key, (row, source_type) in source_index.items():
-            choices = [
-                kind
-                for kind in await list_all(
-                    target, "credential_types/", name=source_type["name"], kind=source_type["kind"]
-                )
-                if kind["name"] == source_type["name"] and kind["kind"] == source_type["kind"]
-            ]
+            type_key = (source_type["name"], source_type["kind"])
+            if type_key not in type_choices:
+                type_choices[type_key] = [
+                    kind
+                    for kind in await list_all(
+                        target,
+                        "credential_types/",
+                        name=source_type["name"],
+                        kind=source_type["kind"],
+                    )
+                    if kind["name"] == source_type["name"] and kind["kind"] == source_type["kind"]
+                ]
+            choices = type_choices[type_key]
             if len(choices) != 1:
                 raise CredentialSyncError(
                     "A matching credential type must already exist in the target; no global types were created."
@@ -268,15 +292,30 @@ class CredentialSession:
                 )
             self.types[row["id"]] = target_type["id"]
             self.matches[row["id"]] = target_index.get(key, (None, None))[0]
-        self.source_fingerprints = await self.source_reader.read(
-            organization, [row["id"] for row in source_rows], self.key
+            if checkpoint is not None:
+                tracked = checkpoint.target_for("credentials", row, target_by_id)
+                natural = self.matches[row["id"]]
+                if tracked and natural and tracked["id"] != natural["id"]:
+                    raise CredentialSyncError(
+                        "Tracked credential identity conflicts with another credential's name/type."
+                    )
+                self.matches[row["id"]] = tracked or natural
+                if checkpoint.can_skip("credentials", row, self.matches[row["id"]]):
+                    self.skipped.add(row["id"])
+        source_ids = [row["id"] for row in source_rows if row["id"] not in self.skipped]
+        target_ids = sorted(
+            {
+                self.matches[row_id]["id"]
+                for row_id in source_ids
+                if self.matches[row_id] is not None
+            }
         )
-        self.target_fingerprints = await self.target_reader.read(
-            organization, [row["id"] for row in target_rows], self.key
-        )
+        self.source_fingerprints = await self.source_reader.read(organization, source_ids, self.key)
+        self.target_fingerprints = await self.target_reader.read(organization, target_ids, self.key)
         if any(
             set(row.get("inputs", {})) != set(self.source_fingerprints[str(row["id"])])
             for row in source_rows
+            if row["id"] not in self.skipped
         ):
             raise CredentialSyncError(
                 "Source credential inputs changed during discovery; rerun the plan."
@@ -286,6 +325,19 @@ class CredentialSession:
         changes, mappings = [], {}
         for row in self.rows:
             current = self.matches[row["id"]]
+            if row["id"] in self.skipped:
+                changes.append(
+                    {
+                        "resource": "credentials",
+                        "name": row["name"],
+                        "action": "unchanged",
+                        "fields": [],
+                        "incremental_skipped": True,
+                    }
+                )
+                mappings[row["id"]] = current["id"]
+                self.verified_metadata[current["id"]] = current
+                continue
             metadata = {
                 "name": row["name"],
                 "description": row.get("description", ""),
@@ -350,4 +402,21 @@ class CredentialSession:
                             "Target credential inputs did not verify after write; values withheld."
                         )
             mappings[row["id"]] = result["id"]
+            self.verified_metadata[result["id"]] = result
         return changes, mappings
+
+    def validate_final(self, target_rows, organization_id, mappings):
+        index = {row["id"]: row for row in target_rows}
+        for row in self.rows:
+            target_id = mappings[row["id"]]
+            current = index.get(target_id)
+            expected = {
+                "name": row["name"],
+                "description": row.get("description", ""),
+                "credential_type": self.types[row["id"]],
+                "organization": organization_id,
+            }
+            if current is None or any(current.get(key) != value for key, value in expected.items()):
+                raise CredentialSyncError(
+                    "Final target credential metadata did not verify; checkpoint not advanced."
+                )
