@@ -1,6 +1,6 @@
 # Experimental organization synchronization
 
-This feature branch adds an on-demand, one-way add/update sync for a named organization. It is work in progress for lab evaluation, with optional OpenShift-backed credential transfer. It does not extend the existing migration compatibility matrix or establish tested AAP 2.4 to 2.7 migration support.
+This feature branch adds an on-demand, one-way add/update sync for a named organization. It is work in progress for lab evaluation, with optional credential transfer through OpenShift or SSH to an RPM Controller. It does not extend the existing migration compatibility matrix or establish tested AAP 2.4 to 2.7 migration support.
 
 ## Plan and apply
 
@@ -52,7 +52,7 @@ Reports include `incremental.resources_skipped`, `resources_processed`, and `che
 
 ## Optional credential access
 
-Credential transfer requires privileged access to the Controller task pods in addition to the API tokens. Both source and target currently use the same configured Kubernetes API/context. Configure namespace and Deployment names for each Controller; the task container can be supplied explicitly if discovery is ambiguous.
+Credential transfer requires privileged access to each Controller runtime in addition to the API tokens. Choose access independently for source and target: `transport: openshift` (the default for existing configurations) or `transport: ssh` for an RPM installation. OpenShift endpoints currently share the configured Kubernetes API/context. Configure namespace and Deployment names for each OpenShift Controller; the task container can be supplied explicitly if discovery is ambiguous.
 
 ```yaml
 credential_sync:
@@ -69,12 +69,38 @@ logging:
   log_payloads: false
 ```
 
+For an AAP 2.4 RPM source and OpenShift target, use:
+
+```yaml
+credential_sync:
+  ssh_binary: ssh
+  oc_binary: oc
+  source:
+    transport: ssh
+    host: controller24.example.com
+    user: bridge
+    port: 22
+    identity_file: /path/to/bridge_ssh_key  # Optional; SSH agent/config also works
+    become_user: awx
+    awx_manage: /usr/bin/awx-manage
+  target:
+    transport: openshift
+    namespace: aap-target
+    deployment: target-controller-task
+logging:
+  log_payloads: false
+```
+
+SSH must reach a Controller node with the installed `awx-manage`, Controller settings, and database connectivity, rather than an execution-only node. Verify the executable path on the customer's installation and override `awx_manage` if needed. Provision SSH authentication and a verified host key in the runtime's known-hosts file before running. SSH uses batch mode, strict host-key checking, and no TTY. The login account needs non-interactive permission to run the helper as the Controller service account using `sudo -n -u awx`; set `become_user: null` when logging in as an account already able to run it. This is privileged access capable of reading Controller credentials; restrict it accordingly. No SSH password or private-key contents belong in this YAML.
+
+The RPM helper loads the installation's Controller configuration, including its local application key (`/etc/tower/SECRET_KEY` on AAP 2.4 RPM). There is no need to copy that key into Bridge or Kubernetes. See [Red Hat's AAP 2.4 secret handling documentation](https://docs.redhat.com/en/documentation/red_hat_ansible_automation_platform/2.4/html/automation_controller_administration_guide/controller-secret-handling-and-connection-security). Both endpoints may use SSH, and the opposite OpenShift-to-RPM combination is also configurable.
+
 ```bash
 aap-bridge --config config.yaml sync --organization demo-organization --with-credentials
 aap-bridge --config config.yaml sync --organization demo-organization --with-credentials --apply
 ```
 
-The provider uses `oc exec` and the installed Controller's ORM/decryption helper with its mounted application key and database settings. It does not export or replace a Controller master key or write database rows directly. Plan comparisons use per-run keyed fingerprints. Changed inputs are sealed to an ephemeral transport key, decrypted in local process memory, and written through the target API. Target decrypted fingerprints are checked after writes. Payload logging must be disabled.
+Both providers run the same installed Controller ORM/decryption helper with its local application key and database settings, using either `oc exec` or SSH. Neither exports or replaces a Controller master key or writes database rows directly. Request data and ephemeral keys travel through standard input rather than command arguments. Plan comparisons use per-run keyed fingerprints. Changed inputs are sealed to an ephemeral transport key, decrypted in local process memory, and written through the target API. Target decrypted fingerprints are checked after writes. Payload logging must be disabled.
 
 Credentials must belong to the selected organization, and a matching compatible credential type must already exist on the target. Global credential types are not created or updated. External secret-manager input sources are rejected. Project credential references are remapped; missing job-template credential associations are added, while target-only associations remain.
 
@@ -82,10 +108,10 @@ Credentials must belong to the selected organization, and a matching compatible 
 
 Use synthetic lab credentials while these findings remain unresolved:
 
-- API and pod-reader Controller identities are not bound together. A misconfigured pod deployment with colliding organization names and credential IDs can supply the wrong credential inputs and still pass the current fingerprint verification. Controller identity and credential metadata checks are required before broader use.
+- API and credential-reader Controller identities are not bound together. A misconfigured pod deployment or SSH host with colliding organization names and credential IDs can supply the wrong credential inputs and still pass the current fingerprint verification. Controller identity and credential metadata checks are required before broader use.
 - A project with the same configured Git URL/branch but a different checkout revision is reported unchanged. The implementation does not request a fresh Git update before synchronizing templates that may reference new playbooks.
 - Source and target pod access need separate Kubernetes contexts/API configuration for cross-cluster use.
-- Live decryption, transfer, target re-encryption, and job-template interoperability have not been validated against the installed AAP versions. Mock tests are not evidence of that compatibility.
+- Live decryption, transfer, target re-encryption, and job-template interoperability have not been validated against the installed AAP versions, including AAP 2.4 RPM over SSH. Mock tests are not evidence of that compatibility.
 
 The standalone test-fixture dependency identified in review has been resolved by placing synthetic fixtures under `tests/fixtures/org_sync/`.
 

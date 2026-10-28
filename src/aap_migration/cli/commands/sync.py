@@ -11,7 +11,7 @@ from aap_migration.cli.decorators import handle_errors, pass_context, requires_c
 from aap_migration.credential_sync import (
     CredentialSession,
     CredentialSyncError,
-    PodCredentialReader,
+    credential_reader,
 )
 from aap_migration.org_sync import SyncError, synchronize
 from aap_migration.sync_checkpoint import CheckpointError, SyncCheckpoint, public_endpoint
@@ -25,7 +25,7 @@ from aap_migration.sync_checkpoint import CheckpointError, SyncCheckpoint, publi
 @click.option(
     "--with-credentials",
     is_flag=True,
-    help="Sync scoped credential inputs using mounted Controller keys via oc exec",
+    help="Sync scoped credential inputs using Controller-local keys via OpenShift or SSH",
 )
 @click.option(
     "--incremental",
@@ -75,7 +75,7 @@ def sync(
         if ctx.config.logging.log_payloads:
             raise click.ClickException("Credential sync requires logging.log_payloads: false.")
         readers = [
-            PodCredentialReader(access, settings.oc_binary, settings.server, settings.verify_ssl)
+            credential_reader(access, settings)
             for access in (settings.source, settings.target)
         ]
         credential_session = CredentialSession(*readers)

@@ -6,19 +6,24 @@ import hmac
 import io
 import json
 import logging
+import shlex
 import unittest
 from copy import deepcopy
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 from cryptography.fernet import Fernet
+from pydantic import ValidationError
 from test_org_sync import MemoryClient, fixture
 
+from aap_migration.config import CredentialSyncConfig, SSHControllerCredentialAccess
 from aap_migration.credential_sync import (
     POD_PROGRAM,
     CredentialSession,
     CredentialSyncError,
     PodCredentialReader,
+    SSHCredentialReader,
+    credential_reader,
     write_credential,
 )
 from aap_migration.org_sync import SyncError, synchronize
@@ -322,6 +327,102 @@ class TestPodEnvelope(unittest.TestCase):
             asyncio.run(reader.read("aap-bridge", [54], key))
         self.assertNotIn(key.decode(), repr(command.call_args.args))
         self.assertIn(key.decode(), command.call_args.kwargs["input"])
+
+
+class TestSSHCredentialAccess(unittest.IsolatedAsyncioTestCase):
+    def access(self, **overrides):
+        return SSHControllerCredentialAccess(
+            transport="ssh", host="controller.example.com", user="bridge", **overrides
+        )
+
+    async def test_sealed_inputs_and_remote_shell_quoting(self):
+        key = Fernet.generate_key()
+        values = {"54": {"password": "test-only-private-value"}}
+        envelope = {
+            "ok": True,
+            "key_loaded": True,
+            "result": {"sealed": Fernet(key).encrypt(json.dumps(values).encode()).decode()},
+        }
+        result = SimpleNamespace(
+            returncode=0, stdout="BRIDGE_CREDENTIAL_RESULT:" + json.dumps(envelope)
+        )
+        reader = SSHCredentialReader(self.access(identity_file="/tmp/bridge key"))
+        with patch("subprocess.run", return_value=result) as command:
+            data = await reader.read("customer's organization", [54], key, "inputs")
+        self.assertEqual(data, values)
+        args = command.call_args.args[0]
+        self.assertEqual(
+            shlex.split(args[-1]),
+            ["sudo", "-n", "-u", "awx", "--", "/usr/bin/awx-manage", "shell", "-c", POD_PROGRAM],
+        )
+        self.assertIn("StrictHostKeyChecking=yes", args)
+        self.assertIn("BatchMode=yes", args)
+        self.assertIn("/tmp/bridge key", args)
+        self.assertNotIn(key.decode(), repr(args))
+        self.assertNotIn("customer's organization", repr(args))
+        request = json.loads(command.call_args.kwargs["input"])
+        self.assertEqual(request["key"], key.decode())
+        self.assertEqual(request["organization"], "customer's organization")
+
+    async def test_direct_service_account_and_fingerprint_read(self):
+        reader = SSHCredentialReader(self.access(become_user=None, port=2222))
+        result = SimpleNamespace(
+            returncode=0,
+            stdout='BRIDGE_CREDENTIAL_RESULT:{"ok":true,"key_loaded":true,"result":{"54":{"password":"digest"}}}',
+        )
+        with patch("subprocess.run", return_value=result) as command:
+            data = await reader.read("demo", [54], Fernet.generate_key())
+        self.assertEqual(data, {"54": {"password": "digest"}})
+        self.assertEqual(shlex.split(command.call_args.args[0][-1])[0], "/usr/bin/awx-manage")
+        self.assertIn("2222", command.call_args.args[0])
+
+    async def test_transport_and_response_errors_are_sanitized(self):
+        reader = SSHCredentialReader(self.access())
+        for result in (
+            SimpleNamespace(returncode=1, stdout="test-only-secret", stderr="test-only-secret"),
+            SimpleNamespace(returncode=0, stdout="test-only-secret"),
+            SimpleNamespace(returncode=0, stdout='BRIDGE_CREDENTIAL_RESULT:{"ok":false}'),
+            SimpleNamespace(
+                returncode=0,
+                stdout='BRIDGE_CREDENTIAL_RESULT:{"ok":true,"key_loaded":true,"result":{"99":{}}}',
+            ),
+        ):
+            with patch("subprocess.run", return_value=result):
+                with self.assertRaises(CredentialSyncError) as failure:
+                    await reader.read("demo", [54], Fernet.generate_key())
+            self.assertNotIn("test-only-secret", str(failure.exception))
+        with patch("subprocess.run", side_effect=RuntimeError("test-only-secret")):
+            with self.assertRaises(CredentialSyncError) as failure:
+                await reader.read("demo", [54], Fernet.generate_key())
+        self.assertNotIn("test-only-secret", str(failure.exception))
+
+    async def test_no_command_for_empty_ids(self):
+        with patch("subprocess.run") as command:
+            self.assertEqual(
+                await SSHCredentialReader(self.access()).read("demo", [], Fernet.generate_key()), {}
+            )
+        command.assert_not_called()
+
+    def test_mixed_transports_and_legacy_openshift_config(self):
+        pod = {"namespace": "aap", "deployment": "controller-task"}
+        ssh = {"transport": "ssh", "host": "controller.example.com", "user": "bridge"}
+        for source, target in ((ssh, pod), (pod, ssh), (pod, pod), (ssh, ssh)):
+            settings = CredentialSyncConfig(source=source, target=target)
+            for access in (settings.source, settings.target):
+                reader = credential_reader(access, settings)
+                expected = SSHCredentialReader if access.transport == "ssh" else PodCredentialReader
+                self.assertIsInstance(reader, expected)
+
+    def test_incomplete_and_option_like_ssh_settings_rejected(self):
+        pod = {"namespace": "aap", "deployment": "controller-task"}
+        for source in (
+            {"transport": "ssh", "user": "bridge"},
+            {"transport": "ssh", "host": "-oProxyCommand=bad", "user": "bridge"},
+            {"transport": "ssh", "host": "controller.example.com", "user": "-root"},
+            {"transport": "ssh", "host": "controller.example.com", "user": "bridge", "port": 0},
+        ):
+            with self.assertRaises(ValidationError):
+                CredentialSyncConfig(source=source, target=pod)
 
 
 if __name__ == "__main__":

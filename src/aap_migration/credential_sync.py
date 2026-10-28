@@ -1,4 +1,4 @@
-"""Organization-scoped credential transfer using the Controllers' mounted keys.
+"""Organization-scoped credential transfer using the Controllers' local keys.
 
 No master key is exported. Decryption uses the installed Controller's own ORM
 and encryption helper. Plan comparisons use per-run keyed fingerprints; apply
@@ -7,6 +7,7 @@ transfers source inputs sealed to a fresh, in-memory transport key.
 
 import base64
 import json
+import shlex
 import subprocess
 
 from cryptography.fernet import Fernet
@@ -61,7 +62,43 @@ except BaseException:
 """
 
 
-class PodCredentialReader:
+class ControllerCredentialReader:
+    """Common scoped request and sealed-response protocol for both transports."""
+
+    async def read(self, organization, ids, key, operation="fingerprints"):
+        if not ids:
+            return {}
+        request = json.dumps(
+            {
+                "organization": organization,
+                "ids": sorted(ids),
+                "key": key.decode(),
+                "operation": operation,
+            }
+        )
+        output = self._execute(request)
+        try:
+            lines = [
+                line for line in output.splitlines() if line.startswith("BRIDGE_CREDENTIAL_RESULT:")
+            ]
+            if len(lines) != 1:
+                raise ValueError()
+            envelope = json.loads(lines[0].split(":", 1)[1])
+            if not envelope.get("ok") or not envelope.get("key_loaded"):
+                raise ValueError()
+            data = envelope["result"]
+            if operation == "inputs":
+                data = json.loads(Fernet(key).decrypt(data["sealed"].encode()))
+            if set(data) != {str(value) for value in ids}:
+                raise ValueError()
+            return data
+        except Exception:
+            raise CredentialSyncError(
+                "Scoped credential read/decryption failed; values and diagnostic output withheld."
+            ) from None
+
+
+class PodCredentialReader(ControllerCredentialReader):
     def __init__(self, access, oc_binary="/usr/local/bin/oc", server=None, verify_ssl=True):
         self.access = access
         self.oc = [oc_binary]
@@ -123,20 +160,10 @@ class PodCredentialReader:
                 "Cannot identify the task container; configure its exact name."
             ) from None
 
-    async def read(self, organization, ids, key, operation="fingerprints"):
-        if not ids:
-            return {}
+    def _execute(self, request):
         if self.container is None:
             self.discover()
-        request = json.dumps(
-            {
-                "organization": organization,
-                "ids": sorted(ids),
-                "key": key.decode(),
-                "operation": operation,
-            }
-        )
-        output = self._run(
+        return self._run(
             [
                 "exec",
                 "-i",
@@ -151,25 +178,53 @@ class PodCredentialReader:
             ],
             request,
         )
+
+
+class SSHCredentialReader(ControllerCredentialReader):
+    """Use SSH without a TTY; key material and request data only use stdin."""
+
+    def __init__(self, access, ssh_binary="ssh"):
+        self.access = access
+        self.ssh_binary = ssh_binary
+
+    def _execute(self, request):
+        access = self.access
+        command = [
+            self.ssh_binary,
+            "-T",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=yes",
+            "-o",
+            "ConnectTimeout=15",
+            "-p",
+            str(access.port),
+        ]
+        if access.identity_file:
+            command += ["-i", access.identity_file]
+        remote = [access.awx_manage, "shell", "-c", POD_PROGRAM]
+        if access.become_user:
+            remote = ["sudo", "-n", "-u", access.become_user, "--"] + remote
+        command += ["-l", access.user, access.host, shlex.join(remote)]
         try:
-            lines = [
-                line for line in output.splitlines() if line.startswith("BRIDGE_CREDENTIAL_RESULT:")
-            ]
-            if len(lines) != 1:
+            result = subprocess.run(
+                command, input=request, capture_output=True, text=True, timeout=120
+            )
+            if result.returncode:
                 raise ValueError()
-            envelope = json.loads(lines[0].split(":", 1)[1])
-            if not envelope.get("ok") or not envelope.get("key_loaded"):
-                raise ValueError()
-            data = envelope["result"]
-            if operation == "inputs":
-                data = json.loads(Fernet(key).decrypt(data["sealed"].encode()))
-            if set(data) != {str(value) for value in ids}:
-                raise ValueError()
-            return data
+            return result.stdout
         except Exception:
             raise CredentialSyncError(
-                "Scoped credential read/decryption failed; values and diagnostic output withheld."
+                "Controller SSH credential access failed; check host trust, SSH authentication, "
+                "non-interactive sudo, and the installed awx-manage path. Details withheld."
             ) from None
+
+
+def credential_reader(access, settings):
+    if access.transport == "ssh":
+        return SSHCredentialReader(access, settings.ssh_binary)
+    return PodCredentialReader(access, settings.oc_binary, settings.server, settings.verify_ssl)
 
 
 async def write_credential(client, endpoint, payload, method):
