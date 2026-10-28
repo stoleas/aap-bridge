@@ -6,6 +6,7 @@ including AAP instances, Vault, performance tuning, and validation settings.
 
 import os
 from pathlib import Path
+from typing import Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
@@ -643,6 +644,34 @@ class TransformConfig(BaseModel):
     )
 
 
+class ControllerCredentialAccess(BaseModel):
+    transport: Literal["openshift"] = "openshift"
+    namespace: str
+    deployment: str
+    container: str | None = None
+
+
+class SSHControllerCredentialAccess(BaseModel):
+    """Run the installed Controller helper on an RPM Controller host."""
+
+    transport: Literal["ssh"]
+    host: str = Field(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9.:-]*$")
+    user: str = Field(pattern=r"^[a-zA-Z_][a-zA-Z0-9_-]*$")
+    port: int = Field(default=22, ge=1, le=65535)
+    identity_file: str | None = None
+    become_user: str | None = "awx"
+    awx_manage: str = "/usr/bin/awx-manage"
+
+
+class CredentialSyncConfig(BaseModel):
+    source: ControllerCredentialAccess | SSHControllerCredentialAccess
+    target: ControllerCredentialAccess | SSHControllerCredentialAccess
+    oc_binary: str = "/usr/local/bin/oc"
+    ssh_binary: str = "ssh"
+    server: str | None = None
+    verify_ssl: bool = True
+
+
 class MigrationConfig(BaseSettings):
     """Main migration configuration."""
 
@@ -656,6 +685,7 @@ class MigrationConfig(BaseSettings):
     # AAP Instances
     source: AAPInstanceConfig = Field(..., description="Source AAP configuration")
     target: AAPInstanceConfig = Field(..., description="Target AAP configuration")
+    credential_sync: CredentialSyncConfig | None = None
 
     # Vault (optional)
     vault: VaultConfig | None = Field(default=None, description="Vault configuration")

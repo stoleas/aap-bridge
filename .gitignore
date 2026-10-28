@@ -136,6 +136,7 @@ celerybeat.pid
 
 # Environments
 .env
+.aap-bridge-sync/
 .envrc
 .venv
 env/
