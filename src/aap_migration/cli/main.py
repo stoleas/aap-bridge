@@ -23,6 +23,7 @@ from aap_migration.cli.commands import patch_projects as patch_projects_commands
 from aap_migration.cli.commands import prep as prep_commands
 from aap_migration.cli.commands import schema as schema_commands
 from aap_migration.cli.commands import state as state_commands
+from aap_migration.cli.commands import sync as sync_commands
 from aap_migration.cli.commands import transform as transform_commands
 from aap_migration.cli.commands import validate as validate_commands
 from aap_migration.cli.context import MigrationContext
@@ -125,6 +126,7 @@ cli.add_command(metadata_commands.metadata)
 cli.add_command(migrate_commands.migrate)
 cli.add_command(schema_commands.schema_group)
 cli.add_command(state_commands.state)
+cli.add_command(sync_commands.sync)
 
 # Register standalone commands
 cli.add_command(cleanup_commands.cleanup)
