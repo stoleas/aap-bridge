@@ -46,3 +46,15 @@ aap-bridge prep --config config.yaml
 ```
 
 If your version pair is not fully supported, the tool will issue a warning and list known exceptions for that path. You can override an "Unsupported" status using the `--force` flag, but this is recommended for experimental use only.
+
+For discovery of a pair absent from this matrix (such as AAP 2.4 → 2.7), use:
+
+```bash
+aap-bridge --config config.yaml prep --allow-untested-path
+```
+
+This permits endpoint and schema discovery only. It does not add the pair to the
+compatibility matrix, enable imports, or establish migration compatibility.
+Existing schema files still require overwrite confirmation. Menu option 1 offers
+this discovery override after explaining that the path is untested. The default
+noninteractive prep command continues to reject unknown paths.

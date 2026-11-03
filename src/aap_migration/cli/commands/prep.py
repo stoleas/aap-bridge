@@ -19,7 +19,6 @@ from aap_migration.cli.decorators import (
     requires_config,
 )
 from aap_migration.cli.utils import (
-    echo_error,
     echo_info,
     echo_success,
     echo_warning,
@@ -51,14 +50,21 @@ logger = get_logger(__name__)
     is_flag=True,
     help="Force re-discovery even if schemas exist",
 )
+@click.option(
+    "--allow-untested-path",
+    is_flag=True,
+    help="Allow discovery for an untested version pair; does not establish migration support",
+)
 @pass_context
 @requires_config
 @handle_errors
-def prep(ctx: MigrationContext, output_dir: Path, force: bool) -> None:
+def prep(
+    ctx: MigrationContext, output_dir: Path, force: bool, allow_untested_path: bool = False
+) -> None:
     """Discover endpoints and generate schemas from AAP instances.
 
     This command:
-    1. Connects to source AAP 2.3 and target AAP 2.6
+    1. Connects to the configured source and target AAP instances
     2. Discovers all available endpoints
     3. Generates schemas for each endpoint
     4. Compares schemas and generates transformation rules
@@ -130,15 +136,20 @@ def prep(ctx: MigrationContext, output_dir: Path, force: bool) -> None:
 
                 version_path = get_version_path(source_version, target_version)
                 if version_path is None:
-                    # Allow override with --force if it's just unknown
-                    if not force:
-                        echo_error(
-                            f"Unsupported migration path: {source_version} → {target_version}"
+                    # Discovery can inspect an untested pair without declaring support.
+                    if not (force or allow_untested_path):
+                        raise click.ClickException(
+                            f"Untested migration path: {source_version} → {target_version}. "
+                            "Use prep --allow-untested-path for discovery only. "
+                            "Migration compatibility remains unverified."
                         )
-                        raise click.ClickException("Unsupported version path")
                     else:
-                        echo_warning(f"Unknown migration path: {source_version} → {target_version}")
-                        echo_warning("Proceeding because --force is set.")
+                        echo_warning(
+                            f"Untested migration path: {source_version} → {target_version}"
+                        )
+                        echo_warning(
+                            "Proceeding with discovery only; migration compatibility remains unverified."
+                        )
                 else:
                     if version_path.status == "partial":
                         echo_warning(f"Partial support for {source_version} → {target_version}")
@@ -261,6 +272,9 @@ def prep(ctx: MigrationContext, output_dir: Path, force: bool) -> None:
             click.echo()
             echo_success(f"Prep complete! Output: {output_dir}/")
 
+        except click.ClickException:
+            # Expected user-facing failures should not expose a traceback or locals.
+            raise
         except Exception as e:
             logger.error(
                 "prep_failed",

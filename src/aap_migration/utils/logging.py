@@ -116,7 +116,7 @@ def configure_logging(
         show_path=False,  # We add logger names via structlog
         markup=True,
         rich_tracebacks=True,
-        tracebacks_show_locals=True,
+        tracebacks_show_locals=False,
     )
     rich_handler.setLevel(console_level)
 
@@ -146,7 +146,9 @@ def configure_logging(
         add_app_context,
         structlog.processors.StackInfoRenderer(),
         structlog.processors.UnicodeDecoder(),
-        structlog.dev.ConsoleRenderer(colors=False),  # RichHandler handles coloring
+        structlog.dev.ConsoleRenderer(
+            colors=False, exception_formatter=structlog.dev.plain_traceback
+        ),
     ]
 
     # Configure structlog with console level
