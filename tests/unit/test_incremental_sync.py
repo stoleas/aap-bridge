@@ -1,4 +1,4 @@
-"""Iterative sync checkpoints: timestamps, dependencies, and failures."""
+"""Iterative sync checkpoints: timestamps, dependencies, failures, and secret rotation."""
 
 import json
 import sqlite3
@@ -11,9 +11,11 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from click.testing import CliRunner
+from test_credential_sync import CredentialClient, Reader, source_snapshot
 from test_org_sync import MemoryClient, fixture
 
 from aap_migration.cli.commands.sync import sync as sync_command
+from aap_migration.credential_sync import CredentialSession
 from aap_migration.org_sync import SyncError, synchronize
 from aap_migration.sync_checkpoint import (
     CheckpointError,
@@ -63,6 +65,14 @@ class TimedClient(Timestamped, MemoryClient):
     pass
 
 
+class TimedCredentialClient(Timestamped, CredentialClient):
+    async def credential_write(self, endpoint, payload, method):
+        result = await super().credential_write(endpoint, payload, method)
+        row = next(row for row in self.tables["credentials"] if row["id"] == result["id"])
+        result["modified"] = row["modified"]
+        return result
+
+
 class TestIncrementalSync(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -77,8 +87,11 @@ class TestIncrementalSync(unittest.IsolatedAsyncioTestCase):
         self.source = TimedClient([fixture("revision-1")], writable=False)
         self.target = TimedClient([fixture("control")])
 
-    async def run_sync(self, apply=True, full=False, scope=None):
-        active_scope = scope or self.scope
+    async def run_sync(self, apply=True, full=False, credentials=False, scope=None):
+        active_scope = {**(scope or self.scope), "with_credentials": credentials}
+        session = None
+        if credentials:
+            session = CredentialSession(Reader(self.source), Reader(self.target))
         with SyncCheckpoint(self.path, active_scope, write=apply, full_resync=full) as checkpoint:
             result = await synchronize(
                 self.source,
@@ -86,8 +99,9 @@ class TestIncrementalSync(unittest.IsolatedAsyncioTestCase):
                 "aap-bridge",
                 apply=apply,
                 checkpoint=checkpoint,
+                credential_session=session,
             )
-        return result, None
+        return result, session
 
     def stored(self):
         with sqlite3.connect(self.path) as connection:
@@ -307,6 +321,110 @@ class TestIncrementalSync(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(SyncError, "did not verify"):
             await self.run_sync()
         self.assertEqual(self.stored(), before)
+
+    async def test_credential_rotation_and_association_changes_are_incremental(self):
+        self.source = TimedCredentialClient([source_snapshot()], writable=False)
+        self.target = TimedCredentialClient([fixture("control")], type_id=303)
+        await self.run_sync(credentials=True)
+        self.target.writes.clear()
+        report, session = await self.run_sync(credentials=True)
+        self.assertEqual(report["incremental"]["resources_skipped"], 7)
+        self.assertTrue(
+            all(
+                not ids
+                for reader in (session.source_reader, session.target_reader)
+                for _, ids, _ in reader.calls
+            )
+        )
+        self.assertEqual(self.target.writes, [])
+        self.source.edit(
+            "credentials", 54, inputs={"username": "bridge-demo", "password": "test-only-rotated"}
+        )
+        report, session = await self.run_sync(credentials=True)
+        self.assertEqual(report["incremental"]["resources_processed"], 1)
+        self.assertEqual(report["incremental"]["resources_skipped"], 6)
+        self.assertEqual(len(self.target.writes), 1)
+        self.assertEqual(self.target.writes[0][0], "PATCH")
+        template = self.target.tables["job_templates"][0]
+        # A many-to-many edit need not bump the template's modified field.
+        template["_credential_ids"] = []
+        self.target.writes.clear()
+        await self.run_sync(credentials=True)
+        self.assertEqual(len(self.target.writes), 1)
+        self.assertTrue(self.target.writes[0][1].endswith("/credentials/"))
+        stored = str(self.stored())
+        self.assertNotIn("test-only-rotated", stored)
+        self.assertNotIn("test-only-secret-v1", stored)
+        self.assertNotIn("username", stored)
+        self.assertNotIn("inputs", stored)
+
+    async def test_source_association_addition_is_detected_without_timestamp_change(self):
+        data = source_snapshot()
+        data["job_templates"][0]["_credential_ids"] = []
+        self.source = TimedCredentialClient([data], writable=False)
+        self.target = TimedCredentialClient([fixture("control")], type_id=303)
+        await self.run_sync(credentials=True)
+        self.source.tables["job_templates"][0]["_credential_ids"] = [54]
+        self.target.writes.clear()
+        report, session = await self.run_sync(credentials=True)
+        self.assertEqual(report["incremental"]["resources_skipped"], 6)
+        self.assertEqual(len(self.target.writes), 1)
+        self.assertTrue(self.target.writes[0][1].endswith("/credentials/"))
+        self.assertTrue(
+            all(
+                not ids
+                for reader in (session.source_reader, session.target_reader)
+                for _, ids, _ in reader.calls
+            )
+        )
+
+    async def test_deleted_target_credential_is_recreated_and_reattached(self):
+        self.source = TimedCredentialClient([source_snapshot()], writable=False)
+        self.target = TimedCredentialClient([fixture("control")], type_id=303)
+        await self.run_sync(credentials=True)
+        removed_id = self.target.tables["credentials"].pop()["id"]
+        self.target.writes.clear()
+        await self.run_sync(credentials=True)
+        created = self.target.tables["credentials"][0]
+        self.assertNotEqual(created["id"], removed_id)
+        self.assertEqual(
+            self.target.tables["job_templates"][0]["_credential_ids"][-1], created["id"]
+        )
+        self.assertEqual(len(self.target.writes), 2)
+
+    async def test_reused_credential_session_recomputes_skip_decisions(self):
+        self.source = TimedCredentialClient([source_snapshot()], writable=False)
+        self.target = TimedCredentialClient([fixture("control")], type_id=303)
+        await self.run_sync(credentials=True)
+        session = CredentialSession(Reader(self.source), Reader(self.target))
+        scope = {**self.scope, "with_credentials": True}
+        with SyncCheckpoint(self.path, scope, write=True) as checkpoint:
+            await synchronize(
+                self.source,
+                self.target,
+                "aap-bridge",
+                apply=True,
+                checkpoint=checkpoint,
+                credential_session=session,
+            )
+        self.source.edit(
+            "credentials", 54, inputs={"username": "bridge-demo", "password": "test-only-next-run"}
+        )
+        self.target.writes.clear()
+        with SyncCheckpoint(self.path, scope, write=True) as checkpoint:
+            report = await synchronize(
+                self.source,
+                self.target,
+                "aap-bridge",
+                apply=True,
+                checkpoint=checkpoint,
+                credential_session=session,
+            )
+        self.assertEqual(report["incremental"]["resources_processed"], 1)
+        self.assertEqual(len(self.target.writes), 1)
+        self.assertEqual(
+            self.target.tables["credentials"][0]["inputs"]["password"], "test-only-next-run"
+        )
 
 
 class TestCheckpointUtilities(unittest.TestCase):

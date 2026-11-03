@@ -44,10 +44,14 @@ def links(row):
             "organization",
             "inventory",
             "project",
+            "credential",
+            "credential_type",
             "scm_revision",
         )
         if key in row
     }
+    if "_credential_ids" in row:
+        result["credentials"] = sorted(set(row["_credential_ids"]))
     return result
 
 
