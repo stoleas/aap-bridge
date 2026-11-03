@@ -174,6 +174,7 @@ async def reconcile(
     organization,
     apply=False,
     project_timeout=300,
+    checkpoint=None,
 ):
     validate(snapshot)
     if not snapshot["organizations"] or snapshot["organizations"]["name"] != organization:
@@ -184,10 +185,24 @@ async def reconcile(
         required=False,
         allow_missing_inventory=True,
     )
+    if checkpoint is not None:
+        checkpoint.bind(snapshot["organizations"], existing["organizations"])
     changes = []
     mappings = {kind: {} for kind in ENDPOINTS}
+    existing_by_id = {kind: {row["id"]: row for row in existing[kind]} for kind in ENDPOINTS}
 
     async def upsert(kind, source, current, parents=None):
+        if checkpoint is not None and checkpoint.can_skip(kind, source, current, parents):
+            changes.append(
+                {
+                    "resource": kind,
+                    "name": source["name"],
+                    "action": "unchanged",
+                    "fields": [],
+                    "incremental_skipped": True,
+                }
+            )
+            return current
         payload = {field: deepcopy(source[field]) for field in FIELDS[kind] if field in source}
         payload.update(parents or {})
         endpoint = "organizations" if kind == "organizations" else ENDPOINTS[kind]
@@ -221,12 +236,27 @@ async def reconcile(
             if kind == "job_templates":
                 parents["project"] = mappings["projects"][row["project"]]
             key = (parents["inventory"], row["name"]) if kind == "hosts" else row["name"]
-            current = index.get(key)
+            current = (
+                checkpoint.target_for(kind, row, existing_by_id[kind])
+                if checkpoint is not None
+                else None
+            )
+            current = current or index.get(key)
+            # Never rename one tracked resource onto another resource's natural key.
+            if current and index.get(key) and current["id"] != index[key]["id"]:
+                raise SyncError("Tracked target identity conflicts with another resource's name.")
             result = await upsert(kind, row, current, parents)
             mappings[kind][row["id"]] = result["id"]
         # Newly created Git projects must finish syncing before playbook validation.
         if kind == "projects" and apply and snapshot["job_templates"]:
-            wait_ids = set(mappings[kind].values())
+            skipped = {
+                row["name"]
+                for row in changes
+                if row["resource"] == "projects" and row.get("incremental_skipped")
+            }
+            wait_ids = {
+                mappings[kind][row["id"]] for row in snapshot[kind] if row["name"] not in skipped
+            }
             for project_id in wait_ids:
                 deadline = time.monotonic() + project_timeout
                 while True:
@@ -254,14 +284,55 @@ async def reconcile(
         "summary": dict(Counter(change["action"] for change in changes)),
         "changes": changes,
     }
+    if checkpoint is not None:
+        report["incremental"] = {
+            "resources_skipped": sum(bool(row.get("incremental_skipped")) for row in changes),
+            "resources_processed": sum(
+                not row.get("incremental_skipped", False) for row in changes
+            ),
+        }
+        if apply:
+            final = await snapshot_org(target, organization)
+            all_mappings = {
+                "organizations": {snapshot["organizations"]["id"]: org["id"]},
+                **mappings,
+            }
+            # A checkpoint is not proof of success unless the final visible fields agree.
+            for kind in ("organizations", *ENDPOINTS):
+                source_rows = [snapshot[kind]] if kind == "organizations" else snapshot[kind]
+                target_rows = [final[kind]] if kind == "organizations" else final[kind]
+                targets = {row["id"]: row for row in target_rows}
+                for row in source_rows:
+                    current = targets.get(all_mappings[kind][row["id"]])
+                    if current is None or any(
+                        not equal(current.get(field), row[field], field)
+                        for field in FIELDS[kind]
+                        if field in row
+                    ):
+                        raise SyncError(
+                            "Final target fields did not verify; incremental checkpoint not advanced."
+                        )
+                    expected_links = {}
+                    if kind in ("inventories", "projects"):
+                        expected_links["organization"] = org["id"]
+                    if kind in ("hosts", "job_templates"):
+                        expected_links["inventory"] = mappings["inventories"][row["inventory"]]
+                    if kind == "job_templates":
+                        expected_links["project"] = mappings["projects"][row["project"]]
+                    if any(current.get(key) != value for key, value in expected_links.items()):
+                        raise SyncError(
+                            "Final target dependencies did not verify; checkpoint not advanced."
+                        )
+            checkpoint.complete(snapshot, final, all_mappings)
     return report
 
 
-async def synchronize(source, target, organization, apply=False):
+async def synchronize(source, target, organization, apply=False, checkpoint=None):
     snapshot = await snapshot_org(source, organization)
     return await reconcile(
         snapshot,
         target,
         organization,
         apply=apply,
+        checkpoint=checkpoint,
     )
